@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rawalpindi Parks Navigation Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --ink:#16302b; --muted:#5d6f6a; --line:#d9e2df; --accent:#1f7a5c; --bg:#f6f9f8; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); }
+  #app { display:flex; height:100%; }
+  #panel { width:340px; max-width:42vw; background:var(--bg); border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
+  #panel header { padding:16px; border-bottom:1px solid var(--line); }
+  #panel h1 { font-size:1.1rem; margin:0 0 4px; }
+  #status { font-size:.85rem; color:var(--muted); margin:0; }
+  #parks { list-style:none; margin:0; padding:8px; overflow:auto; }
+  #parks button { width:100%; text-align:left; padding:10px 12px; margin-bottom:6px; border:1px solid var(--line); border-radius:8px; background:#fff; cursor:pointer; font:inherit; color:inherit; }
+  #parks button:hover, #parks button.active { border-color:var(--accent); background:#e8f4ef; }
+  #parks small { display:block; color:var(--muted); }
+  #route { padding:12px 16px; border-top:1px solid var(--line); overflow:auto; flex:1; display:none; }
+  #route h2 { font-size:1rem; margin:0 0 4px; }
+  #summary { margin:0 0 8px; font-weight:600; color:var(--accent); }
+  #steps { margin:0; padding-left:20px; font-size:.88rem; line-height:1.45; }
+  #clear { margin-top:10px; padding:6px 12px; border:1px solid var(--line); background:#fff; border-radius:6px; cursor:pointer; font:inherit; }
+  #map { flex:1; }
+  button:focus-visible { outline:3px solid var(--accent); outline-offset:2px; }
+  @media (max-width:700px) {
+    #app { flex-direction:column-reverse; }
+    #panel { width:100%; max-width:none; height:48%; border-right:0; border-top:1px solid var(--line); }
+    #map { height:52%; flex:none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <header>
+      <h1>Rawalpindi Parks Navigation</h1>
+      <p id="status">Finding your location…</p>
+    </header>
+    <ul id="parks" aria-label="Parks in Rawalpindi"></ul>
+    <section id="route" aria-live="polite">
+      <h2 id="routeTitle"></h2>
+      <p id="summary"></p>
+      <ol id="steps"></ol>
+      <button id="clear" type="button">Clear route</button>
+    </section>
+  </aside>
+  <div id="map" role="application" aria-label="Map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* ---------- 1. DATA: edit this list to add or fix parks ----------
+   Coordinates are approximate. Check each one on OpenStreetMap or
+   Google Maps (right-click > copy coordinates) and correct as needed. */
+const PARKS = [
+  { name: "Ayub National Park", lat: 33.6240, lng: 73.0830 },
+  { name: "Jinnah Park",        lat: 33.6010, lng: 73.0715 },
+  { name: "Liaquat Bagh",       lat: 33.5974, lng: 73.0553 },
+  { name: "Race Course Park",   lat: 33.5990, lng: 73.0640 }
+];
+const CITY_CENTER = [33.6007, 73.0679];
+const OSRM_URL = "https://router.project-osrm.org/route/v1/driving";
+
+/* ---------- 2. STATE ---------- */
+let userLatLng = null;
+let userMarker = null;
+let routeLayer = null;
+let selectedPark = null;
+let firstFix = true;
+
+/* ---------- 3. MAP SETUP ----------
+   OpenStreetMap blocks tile requests from files opened off your computer
+   (file://), so a fallback base map is used there. When the page is hosted
+   (GitHub Pages), the OpenStreetMap base layer is used. */
+const map = L.map("map").setView(CITY_CENTER, 12);
+const isLocalFile = location.protocol === "file:";
+
+if (isLocalFile) {
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", {
+    maxZoom: 19,
+    attribution: "Tiles &copy; Esri (local preview)"
+  }).addTo(map);
+} else {
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors"
+  }).addTo(map);
+}
+
+const statusEl = document.getElementById("status");
+const setStatus = (t) => { statusEl.textContent = t; };
+
+/* ---------- 4. PARK LIST + MARKERS ---------- */
+const listEl = document.getElementById("parks");
+PARKS.forEach((park) => {
+  park.marker = L.marker([park.lat, park.lng]).addTo(map).bindPopup(`<b>${park.name}</b>`);
+  park.marker.on("click", () => selectPark(park));
+
+  const li = document.createElement("li");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = park.name;
+  const small = document.createElement("small");
+  small.textContent = "Tap for directions";
+  btn.appendChild(small);
+  btn.addEventListener("click", () => selectPark(park));
+  li.appendChild(btn);
+  listEl.appendChild(li);
+  park.button = btn;
+});
+
+/* ---------- 5. USER LOCATION (HTML5 geolocation) ---------- */
+function setUserLocation(lat, lng) {
+  userLatLng = [lat, lng];
+  if (!userMarker) {
+    userMarker = L.circleMarker(userLatLng, {
+      radius: 9, color: "#fff", weight: 3, fillColor: "#2563eb", fillOpacity: 1
+    }).addTo(map).bindPopup("You are here");
+  } else {
+    userMarker.setLatLng(userLatLng);
+  }
+}
+
+function startTracking() {
+  if (!("geolocation" in navigator)) {
+    setStatus("Geolocation is not supported. Click the map to set your start point.");
+    return;
+  }
+  navigator.geolocation.watchPosition(
+    (pos) => {
+      setUserLocation(pos.coords.latitude, pos.coords.longitude);
+      setStatus("Location found. Choose a park.");
+      if (firstFix) { map.setView(userLatLng, 13); firstFix = false; }
+    },
+    (err) => {
+      const msg = err.code === 1 ? "Location permission denied." : "Could not get your location.";
+      setStatus(msg + " Click the map to set your start point.");
+    },
+    { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 }
+  );
+}
+
+/* Fallback: click the map to choose a start point */
+map.on("click", (e) => {
+  setUserLocation(e.latlng.lat, e.latlng.lng);
+  setStatus("Start point set from map click.");
+  if (selectedPark) getRoute(selectedPark);
+});
+
+/* ---------- 6. ROUTING (OSRM) ---------- */
+function selectPark(park) {
+  selectedPark = park;
+  PARKS.forEach((p) => p.button.classList.toggle("active", p === park));
+  if (!userLatLng) {
+    setStatus("No start point yet. Allow location or click the map.");
+    map.setView([park.lat, park.lng], 15);
+    park.marker.openPopup();
+    return;
+  }
+  getRoute(park);
+}
+
+async function getRoute(park) {
+  const [uLat, uLng] = userLatLng;
+  const url = `${OSRM_URL}/${uLng},${uLat};${park.lng},${park.lat}` +
+              `?overview=full&geometries=geojson&steps=true`;
+  setStatus(`Finding route to ${park.name}…`);
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    if (data.code !== "Ok" || !data.routes.length) throw new Error(data.code || "No route");
+    drawRoute(park, data.routes[0]);
+    setStatus(`Route to ${park.name} ready.`);
+  } catch (err) {
+    setStatus("Routing failed (" + err.message + "). Check your connection and try again.");
+  }
+}
+
+function drawRoute(park, route) {
+  if (routeLayer) map.removeLayer(routeLayer);
+  routeLayer = L.geoJSON(route.geometry, { style: { color: "#1f7a5c", weight: 6, opacity: 0.9 } }).addTo(map);
+  map.fitBounds(routeLayer.getBounds(), { padding: [40, 40] });
+
+  document.getElementById("routeTitle").textContent = "To " + park.name;
+  document.getElementById("summary").textContent =
+    `${(route.distance / 1000).toFixed(1)} km, about ${Math.max(1, Math.round(route.duration / 60))} min by car`;
+
+  const stepsEl = document.getElementById("steps");
+  stepsEl.innerHTML = "";
+  route.legs[0].steps.forEach((s) => {
+    const li = document.createElement("li");
+    li.textContent = `${describeStep(s)} (${formatDist(s.distance)})`;
+    stepsEl.appendChild(li);
+  });
+  document.getElementById("route").style.display = "block";
+}
+
+/* ---------- 7. TURN-BY-TURN TEXT ---------- */
+function describeStep(step) {
+  const { type, modifier } = step.maneuver;
+  const road = step.name ? " onto " + step.name : "";
+  if (type === "depart") return "Start" + (step.name ? " on " + step.name : "");
+  if (type === "arrive") return "Arrive at your destination";
+  if (type === "roundabout" || type === "rotary") return "Take the roundabout" + road;
+  if (type === "continue" || modifier === "straight") return "Continue straight" + (step.name ? " on " + step.name : "");
+  if (modifier) return "Turn " + modifier + road;
+  return "Continue" + road;
+}
+function formatDist(m) {
+  return m >= 1000 ? (m / 1000).toFixed(1) + " km" : Math.round(m) + " m";
+}
+
+/* ---------- 8. CLEAR ROUTE ---------- */
+document.getElementById("clear").addEventListener("click", () => {
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+  selectedPark = null;
+  PARKS.forEach((p) => p.button.classList.remove("active"));
+  document.getElementById("route").style.display = "none";
+  setStatus("Route cleared. Choose a park.");
+});
+
+startTracking();
+</script>
+</body>
+</html>
